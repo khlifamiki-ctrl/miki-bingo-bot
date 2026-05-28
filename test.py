@@ -2,7 +2,8 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import random
 
-TOKEN = "8670452563:AAFp_eKsW2lJCxu4JfwVM4nTHsGUlGzG1zU"
+import os
+TOKEN = os.getenv("TOKEN", "8670452563:AAFp_eKsW2IJCxu4JfwVM4nTHsGUlGzG1zU")
 
 scores = {}
 balances = {}
