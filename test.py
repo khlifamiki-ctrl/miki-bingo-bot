@@ -1,11 +1,13 @@
 import os
 import sqlite3
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import random
 
-# TOKEN is read from Railway's environment Variables (never hardcode it in code)
+# TOKEN is read from the platform's environment Variables (never hardcode it in code)
 TOKEN = os.environ.get("TOKEN")
 BOT_USERNAME = "miki_bingo_bot"
 
@@ -14,6 +16,26 @@ DAILY_BONUS_AMOUNT = 100
 DAILY_COOLDOWN_HOURS = 24
 REFERRER_REWARD = 100
 REFERRED_REWARD = 50
+
+# ---------- TINY HEALTH CHECK SERVER (needed for Render Web Service) ----------
+# Render's free tier requires the app to bind to a port so it can detect the
+# service is alive. This runs a minimal server in the background; it does not
+# affect the Telegram bot logic at all.
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Miki Bingo Bot is running")
+
+        def log_message(self, format, *args):
+            pass  # keep logs clean
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
 # ---------- DATABASE SETUP ----------
 
@@ -32,7 +54,6 @@ def init_db():
     """)
     conn.commit()
 
-    # Safe migrations in case an older version of the table already exists
     for column_def in ["last_daily_bonus TEXT", "referred_by INTEGER"]:
         try:
             cur.execute(f"ALTER TABLE users ADD COLUMN {column_def}")
@@ -72,7 +93,6 @@ def get_balance(user_id, username):
     return row[0]
 
 def update_balance(user_id, username, delta):
-    # Ensures the user exists first
     get_balance(user_id, username)
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -87,7 +107,7 @@ def update_balance(user_id, username, delta):
     return new_balance
 
 def get_last_daily_bonus(user_id, username):
-    get_balance(user_id, username)  # ensure user exists
+    get_balance(user_id, username)
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT last_daily_bonus FROM users WHERE user_id = ?", (user_id,))
@@ -133,11 +153,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             referrer_id = int(context.args[0])
 
         if referrer_id == user_id:
-            # Someone tried to use their own referral link
             extra_note = "🚫 You can't use your own referral link.\n\n"
             create_user(user_id, name)
         elif referrer_id is not None and user_exists(referrer_id):
-            # Valid referral
             create_user(user_id, name, referred_by=referrer_id)
             update_balance(referrer_id, "", REFERRER_REWARD)
             update_balance(user_id, name, REFERRED_REWARD)
@@ -163,7 +181,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.effective_user.first_name
-    get_balance(user_id, name)  # ensure user exists
+    get_balance(user_id, name)
 
     link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
 
@@ -188,7 +206,7 @@ async def bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Balance: {new_balance}"
         )
     else:
-        get_balance(user_id, name)  # make sure user exists
+        get_balance(user_id, name)
         msg = f"🎯 {name} got bingo number {number}"
 
     await update.message.reply_text(msg)
@@ -289,6 +307,9 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 init_db()
 
+# Start the tiny health-check web server in the background (for Render)
+threading.Thread(target=run_health_server, daemon=True).start()
+
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
@@ -300,6 +321,6 @@ app.add_handler(CommandHandler("balance", balance))
 app.add_handler(CommandHandler("daily", daily))
 app.add_handler(CommandHandler("invite", invite))
 
-print("Bot is running with database, daily bonus, and referrals...")
+print("Bot is running with database, daily bonus, referrals, and health server...")
 
 app.run_polling()
