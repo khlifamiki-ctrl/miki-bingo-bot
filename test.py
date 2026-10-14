@@ -159,6 +159,30 @@ def set_last_daily_bonus(user_id, timestamp_str):
     conn.close()
 
 
+def get_top_users(limit=10):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT username, balance FROM users ORDER BY balance DESC, created_at ASC LIMIT ?",
+        (limit,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_rank(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) + 1 FROM users WHERE balance > (SELECT balance FROM users WHERE user_id = ?)",
+        (user_id,)
+    )
+    rank = cur.fetchone()[0]
+    conn.close()
+    return rank
+
+
 # ---------- COOLDOWN HELPERS ----------
 
 def get_cooldown_remaining(user_id, game):
@@ -218,7 +242,7 @@ async def blocked_by_cooldown(update, user_id, name, game):
 
 keyboard = [
     ["/bingo", "/spin", "/dice"],
-    ["/jackpot", "/balance"],
+    ["/jackpot", "/balance", "/top"],
     ["/daily", "/invite"]
 ]
 
@@ -262,6 +286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 /bingo - Play bingo\n"
         "💰 /balance - Check coins\n"
         "🎁 /daily - Daily bonus\n"
+        "🏆 /top - Leaderboard\n"
         "👥 /invite - Invite friends\n\n"
         "👇 Choose a button below 👇"
     )
@@ -386,6 +411,24 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    my_balance = get_balance(user_id, name)
+
+    rows = get_top_users(10)
+    medals = ["🥇", "🥈", "🥉"]
+
+    lines = ["🏆 LEADERBOARD - Top 10\n"]
+    for i, (username, bal) in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} {username or 'Player'} - {bal} coins")
+
+    lines.append(f"\n📍 Your rank: #{get_rank(user_id)} ({my_balance} coins)")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.effective_user.first_name
@@ -439,6 +482,7 @@ app.add_handler(CommandHandler("jackpot", jackpot))
 app.add_handler(CommandHandler("balance", balance))
 app.add_handler(CommandHandler("daily", daily))
 app.add_handler(CommandHandler("invite", invite))
+app.add_handler(CommandHandler("top", top))
 
 print(f"Bot is running. Database: {DB_FILE}")
 
