@@ -22,6 +22,13 @@ DAILY_COOLDOWN_HOURS = 24
 REFERRER_REWARD = 100
 REFERRED_REWARD = 50
 
+# Admin Telegram user IDs (comma separated). Can be overridden with the
+# ADMIN_IDS variable in Railway. Default is the owner's ID.
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "6644747606").split(",")
+    if x.strip().isdigit()
+}
+
 # Cooldowns in seconds for each game (change these numbers as you like)
 COOLDOWNS = {
     "spin": 3600,      # 1 hour
@@ -169,6 +176,36 @@ def get_top_users(limit=10):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def get_stats():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM users")
+    total_users, total_coins = cur.fetchone()
+    cur.execute(
+        "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-1 day')"
+    )
+    new_today = cur.fetchone()[0]
+    conn.close()
+    return total_users, total_coins, new_today
+
+
+def get_user_info(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT username, balance, referred_by, created_at FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    if row:
+        cur.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
+        referrals = cur.fetchone()[0]
+    else:
+        referrals = 0
+    conn.close()
+    return row, referrals
 
 
 def get_rank(user_id):
@@ -429,6 +466,113 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ---------- ADMIN COMMANDS (only for ADMIN_IDS) ----------
+
+def is_admin(update: Update):
+    return update.effective_user.id in ADMIN_IDS
+
+
+def parse_target_and_amount(context):
+    """Returns (user_id, amount) from '/cmd <user_id> <amount>' or None."""
+    if len(context.args) != 2:
+        return None
+    if not context.args[0].isdigit() or not context.args[1].isdigit():
+        return None
+    amount = int(context.args[1])
+    if amount <= 0:
+        return None
+    return int(context.args[0]), amount
+
+
+async def give(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    parsed = parse_target_and_amount(context)
+    if not parsed:
+        await update.message.reply_text("Usage: /give <user_id> <amount>")
+        return
+
+    target_id, amount = parsed
+    if not user_exists(target_id):
+        await update.message.reply_text("❌ User not found. They must press /start first.")
+        return
+
+    new_balance = update_balance(target_id, None, amount)
+    await update.message.reply_text(
+        f"✅ Gave {amount} coins to {target_id}.\n💰 New balance: {new_balance}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎁 You received {amount} coins!\n💰 Balance: {new_balance}"
+        )
+    except Exception:
+        pass  # user may have blocked the bot
+
+
+async def take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    parsed = parse_target_and_amount(context)
+    if not parsed:
+        await update.message.reply_text("Usage: /take <user_id> <amount>")
+        return
+
+    target_id, amount = parsed
+    if not user_exists(target_id):
+        await update.message.reply_text("❌ User not found.")
+        return
+
+    current = get_balance(target_id, None)
+    amount = min(amount, current)  # never go below 0
+    new_balance = update_balance(target_id, None, -amount)
+    await update.message.reply_text(
+        f"✅ Took {amount} coins from {target_id}.\n💰 New balance: {new_balance}"
+    )
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    total_users, total_coins, new_today = get_stats()
+    await update.message.reply_text(
+        "📊 BOT STATS\n\n"
+        f"👥 Total users: {total_users}\n"
+        f"🆕 New in last 24h: {new_today}\n"
+        f"💰 Total coins: {total_coins}"
+    )
+
+
+async def userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /user <user_id>")
+        return
+
+    target_id = int(context.args[0])
+    row, referrals = get_user_info(target_id)
+    if not row:
+        await update.message.reply_text("❌ User not found.")
+        return
+
+    username, bal, referred_by, created_at = row
+    await update.message.reply_text(
+        "👤 USER INFO\n\n"
+        f"🆔 ID: {target_id}\n"
+        f"📛 Name: {username}\n"
+        f"💰 Balance: {bal}\n"
+        f"👥 Invited friends: {referrals}\n"
+        f"🔗 Referred by: {referred_by or '-'}\n"
+        f"📅 Joined: {created_at}"
+    )
+
+
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = update.effective_user.first_name
@@ -483,6 +627,10 @@ app.add_handler(CommandHandler("balance", balance))
 app.add_handler(CommandHandler("daily", daily))
 app.add_handler(CommandHandler("invite", invite))
 app.add_handler(CommandHandler("top", top))
+app.add_handler(CommandHandler("give", give))
+app.add_handler(CommandHandler("take", take))
+app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("user", userinfo))
 
 print(f"Bot is running. Database: {DB_FILE}")
 
