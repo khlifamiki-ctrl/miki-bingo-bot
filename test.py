@@ -29,6 +29,18 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
+# Entry fee (coins) for each paid game. /spin and /daily stay free.
+GAME_COSTS = {
+    "dice": 20,
+    "bingo": 10,
+    "jackpot": 50,
+}
+
+# Prize (coins) when the player wins. Net profit = prize - fee.
+DICE_PRIZE = 100
+BINGO_PRIZE = 80
+JACKPOT_PRIZE = 800
+
 # Cooldowns in seconds for each game (change these numbers as you like)
 COOLDOWNS = {
     "spin": 3600,      # 1 hour
@@ -275,6 +287,19 @@ async def blocked_by_cooldown(update, user_id, name, game):
     return False
 
 
+async def not_enough_coins(update, user_id, name, game):
+    """Returns True (and tells the user) if they can't afford the game."""
+    cost = GAME_COSTS[game]
+    bal = get_balance(user_id, name)
+    if bal < cost:
+        await update.message.reply_text(
+            f"💸 {name}, /{game} costs {cost} coins but you have {bal}.\n"
+            "🎡 Use /spin or 🎁 /daily to earn free coins!"
+        )
+        return True
+    return False
+
+
 # ---------- KEYBOARD ----------
 
 keyboard = [
@@ -318,9 +343,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{extra_note}"
         "🎉 WELCOME TO WIN BIRR BINGO! 🎉\n\n"
         "🎮 Play games and win coins!\n\n"
-        "🎡 /spin - Spin wheel\n"
-        "🎲 /dice - Roll dice\n"
-        "🎯 /bingo - Play bingo\n"
+        "🎡 /spin - Spin wheel (free)\n"
+        f"🎲 /dice - Roll dice ({GAME_COSTS['dice']} coins)\n"
+        f"🎯 /bingo - Play bingo ({GAME_COSTS['bingo']} coins)\n"
+        f"💎 /jackpot - Jackpot ({GAME_COSTS['jackpot']} coins)\n"
         "💰 /balance - Check coins\n"
         "🎁 /daily - Daily bonus\n"
         "🏆 /top - Leaderboard\n"
@@ -354,19 +380,27 @@ async def bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await blocked_by_cooldown(update, user_id, name, "bingo"):
         return
+    if await not_enough_coins(update, user_id, name, "bingo"):
+        return
     set_cooldown(user_id, "bingo")
+    update_balance(user_id, name, -GAME_COSTS["bingo"])
 
     number = random.randint(1, 100)
 
     if number > 90:
-        new_balance = update_balance(user_id, name, 100)
+        new_balance = update_balance(user_id, name, BINGO_PRIZE)
         msg = (
             f"🏆 {name} got bingo number {number}!\n"
-            f"🎁 You won 100 coins!\n"
+            f"🎁 You won {BINGO_PRIZE} coins!\n"
             f"💰 Balance: {new_balance}"
         )
     else:
-        msg = f"🎯 {name} got bingo number {number}"
+        new_balance = get_balance(user_id, name)
+        msg = (
+            f"🎯 {name} got bingo number {number}\n"
+            f"❌ No win (-{GAME_COSTS['bingo']} coins)\n"
+            f"💰 Balance: {new_balance}"
+        )
 
     await update.message.reply_text(msg)
 
@@ -395,21 +429,26 @@ async def dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await blocked_by_cooldown(update, user_id, name, "dice"):
         return
+    if await not_enough_coins(update, user_id, name, "dice"):
+        return
     set_cooldown(user_id, "dice")
+    update_balance(user_id, name, -GAME_COSTS["dice"])
 
     roll = random.randint(1, 6)
 
     if roll == 6:
-        new_balance = update_balance(user_id, name, 200)
+        new_balance = update_balance(user_id, name, DICE_PRIZE)
         msg = (
             f"🎲 Dice rolled: {roll}\n"
-            f"🏆 You won 200 coins!\n"
+            f"🏆 You won {DICE_PRIZE} coins!\n"
             f"💰 Balance: {new_balance}"
         )
     else:
+        new_balance = get_balance(user_id, name)
         msg = (
             f"🎲 Dice rolled: {roll}\n"
-            "❌ Try again!"
+            f"❌ Try again! (-{GAME_COSTS['dice']} coins)\n"
+            f"💰 Balance: {new_balance}"
         )
 
     await update.message.reply_text(msg)
@@ -422,18 +461,23 @@ async def jackpot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await blocked_by_cooldown(update, user_id, name, "jackpot"):
         return
+    if await not_enough_coins(update, user_id, name, "jackpot"):
+        return
     set_cooldown(user_id, "jackpot")
+    update_balance(user_id, name, -GAME_COSTS["jackpot"])
 
     lucky = random.randint(1, 20)
 
     if lucky == 7:
-        new_balance = update_balance(user_id, name, 1000)
+        new_balance = update_balance(user_id, name, JACKPOT_PRIZE)
         await update.message.reply_text(
-            f"💎 JACKPOT!\n🏆 {name} won 1000 coins!\n💰 Balance: {new_balance}"
+            f"💎 JACKPOT!\n🏆 {name} won {JACKPOT_PRIZE} coins!\n💰 Balance: {new_balance}"
         )
     else:
+        new_balance = get_balance(user_id, name)
         await update.message.reply_text(
-            "❌ No jackpot!\n🎰 Try again!"
+            f"❌ No jackpot! (-{GAME_COSTS['jackpot']} coins)\n"
+            f"🎰 Try again!\n💰 Balance: {new_balance}"
         )
 
 
