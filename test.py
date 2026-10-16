@@ -391,7 +391,7 @@ async def bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_balance = update_balance(user_id, name, BINGO_PRIZE)
         msg = (
             f"🏆 {name} got bingo number {number}!\n"
-            f"🎁 You won {BINGO_PRIZE} coins!\n"
+            f"🎁 You won {BINGO_PRIZE} coins! (net +{BINGO_PRIZE - GAME_COSTS['bingo']})\n"
             f"💰 Balance: {new_balance}"
         )
     else:
@@ -440,7 +440,7 @@ async def dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_balance = update_balance(user_id, name, DICE_PRIZE)
         msg = (
             f"🎲 Dice rolled: {roll}\n"
-            f"🏆 You won {DICE_PRIZE} coins!\n"
+            f"🏆 You won {DICE_PRIZE} coins! (net +{DICE_PRIZE - GAME_COSTS['dice']})\n"
             f"💰 Balance: {new_balance}"
         )
     else:
@@ -471,7 +471,7 @@ async def jackpot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lucky == 7:
         new_balance = update_balance(user_id, name, JACKPOT_PRIZE)
         await update.message.reply_text(
-            f"💎 JACKPOT!\n🏆 {name} won {JACKPOT_PRIZE} coins!\n💰 Balance: {new_balance}"
+            f"💎 JACKPOT!\n🏆 {name} won {JACKPOT_PRIZE} coins! (net +{JACKPOT_PRIZE - GAME_COSTS['jackpot']})\n💰 Balance: {new_balance}"
         )
     else:
         new_balance = get_balance(user_id, name)
