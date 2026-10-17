@@ -41,12 +41,16 @@ DICE_PRIZE = 100
 BINGO_PRIZE = 80
 JACKPOT_PRIZE = 800
 
+# Sending coins between players
+SEND_MIN_AMOUNT = 10
+
 # Cooldowns in seconds for each game (change these numbers as you like)
 COOLDOWNS = {
     "spin": 3600,      # 1 hour
     "dice": 1800,      # 30 minutes
     "bingo": 600,      # 10 minutes
     "jackpot": 1800,   # 30 minutes
+    "send": 60,        # 1 minute between transfers
 }
 
 
@@ -188,6 +192,26 @@ def get_top_users(limit=10):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def transfer_coins(from_id, to_id, amount):
+    """Moves coins in ONE database transaction. Returns False if not enough coins."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (amount, from_id, amount)
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    cur.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (amount, to_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def get_stats():
@@ -350,6 +374,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 /balance - Check coins\n"
         "🎁 /daily - Daily bonus\n"
         "🏆 /top - Leaderboard\n"
+        "💌 /send - Send coins to a friend\n"
+        "🆔 /id - Show your ID\n"
         "👥 /invite - Invite friends\n\n"
         "👇 Choose a button below 👇"
     )
@@ -490,6 +516,66 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💰 Your balance is {bal} coins"
     )
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    get_balance(user_id, name)
+    await update.message.reply_text(
+        f"🆔 Your ID: {user_id}\n\n"
+        "Share it with a friend so they can send you coins:\n"
+        f"/send {user_id} <amount>"
+    )
+
+
+async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    get_balance(user_id, name)
+
+    parsed = parse_target_and_amount(context)
+    if not parsed:
+        await update.message.reply_text(
+            "Usage: /send <user_id> <amount>\n"
+            "Your friend can get their ID with /id"
+        )
+        return
+
+    target_id, amount = parsed
+
+    if target_id == user_id:
+        await update.message.reply_text("🚫 You can't send coins to yourself.")
+        return
+    if amount < SEND_MIN_AMOUNT:
+        await update.message.reply_text(f"🚫 Minimum is {SEND_MIN_AMOUNT} coins.")
+        return
+    if not user_exists(target_id):
+        await update.message.reply_text("❌ User not found. They must press /start first.")
+        return
+    if await blocked_by_cooldown(update, user_id, name, "send"):
+        return
+
+    if not transfer_coins(user_id, target_id, amount):
+        bal = get_balance(user_id, name)
+        await update.message.reply_text(
+            f"💸 Not enough coins. You have {bal}."
+        )
+        return
+
+    set_cooldown(user_id, "send")
+    my_balance = get_balance(user_id, name)
+    await update.message.reply_text(
+        f"✅ Sent {amount} coins to {target_id}.\n💰 Your balance: {my_balance}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎁 {name} sent you {amount} coins!\n💰 Balance: {get_balance(target_id, None)}"
+        )
+    except Exception:
+        pass  # user may have blocked the bot
 
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -671,6 +757,8 @@ app.add_handler(CommandHandler("balance", balance))
 app.add_handler(CommandHandler("daily", daily))
 app.add_handler(CommandHandler("invite", invite))
 app.add_handler(CommandHandler("top", top))
+app.add_handler(CommandHandler("send", send))
+app.add_handler(CommandHandler("id", myid))
 app.add_handler(CommandHandler("give", give))
 app.add_handler(CommandHandler("take", take))
 app.add_handler(CommandHandler("stats", stats))
