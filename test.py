@@ -1,11 +1,13 @@
 import os
+import time
+import asyncio
 import sqlite3
 import threading
 import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # TOKEN is read from the platform's environment Variables (never hardcode it)
 TOKEN = os.environ.get("TOKEN")
@@ -40,6 +42,13 @@ GAME_COSTS = {
 DICE_PRIZE = 100
 BINGO_PRIZE = 80
 JACKPOT_PRIZE = 800
+
+# Live Bingo round (virtual coins only - no cash in or out)
+LIVE_ENTRY_FEE = 10        # coins to join a round
+LIVE_LOBBY_SECONDS = 60    # time to wait for players
+LIVE_DRAW_SECONDS = 5      # seconds between numbers
+LIVE_MIN_PLAYERS = 2
+LIVE_MAX_PLAYERS = 30
 
 # Sending coins between players
 SEND_MIN_AMOUNT = 10
@@ -93,6 +102,12 @@ def init_db():
             game TEXT,
             last_play TEXT,
             PRIMARY KEY (user_id, game)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS live_round_players (
+            user_id INTEGER PRIMARY KEY,
+            fee INTEGER
         )
     """)
     conn.commit()
@@ -214,6 +229,52 @@ def transfer_coins(from_id, to_id, amount):
     return True
 
 
+def join_live_round(user_id, fee):
+    """Takes the entry fee and records it, in one transaction. False if not enough coins."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (fee, user_id, fee)
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    cur.execute(
+        "INSERT OR REPLACE INTO live_round_players (user_id, fee) VALUES (?, ?)",
+        (user_id, fee)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def settle_live_round(winner_id, pot):
+    """Pays the pot to the winner and clears the round, in one transaction."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (pot, winner_id))
+    cur.execute("DELETE FROM live_round_players")
+    conn.commit()
+    conn.close()
+
+
+def refund_live_round():
+    """Gives every entry fee back and clears the round. Returns how many players."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE users SET balance = balance +
+            (SELECT fee FROM live_round_players WHERE live_round_players.user_id = users.user_id)
+        WHERE user_id IN (SELECT user_id FROM live_round_players)
+    """)
+    count = cur.rowcount
+    cur.execute("DELETE FROM live_round_players")
+    conn.commit()
+    conn.close()
+    return count
+
+
 def get_stats():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -329,7 +390,7 @@ async def not_enough_coins(update, user_id, name, game):
 keyboard = [
     ["/bingo", "/spin", "/dice"],
     ["/jackpot", "/balance", "/top"],
-    ["/daily", "/invite"]
+    ["/daily", "/invite", "/live"]
 ]
 
 reply_markup = ReplyKeyboardMarkup(
@@ -374,6 +435,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 /balance - Check coins\n"
         "🎁 /daily - Daily bonus\n"
         "🏆 /top - Leaderboard\n"
+        f"🎱 /live - Live Bingo round ({LIVE_ENTRY_FEE} coins)\n"
         "💌 /send - Send coins to a friend\n"
         "🆔 /id - Show your ID\n"
         "👥 /invite - Invite friends\n\n"
@@ -516,6 +578,237 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💰 Your balance is {bal} coins"
     )
+
+
+# ---------- LIVE BINGO ROUND ----------
+
+LIVE = {"round": None}   # the one round that is running right now
+
+CLAIM_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🎯 BINGO!", callback_data="bingo_claim")]]
+)
+
+
+def make_card():
+    """5x5 card: B 1-15, I 16-30, N 31-45, G 46-60, O 61-75. Centre (0) is free."""
+    cols = [random.sample(range(1 + 15 * c, 16 + 15 * c), 5) for c in range(5)]
+    card = [[cols[c][r] for c in range(5)] for r in range(5)]
+    card[2][2] = 0
+    return card
+
+
+def card_has_bingo(card, drawn_set):
+    def ok(v):
+        return v == 0 or v in drawn_set
+
+    for i in range(5):
+        if all(ok(card[i][j]) for j in range(5)):
+            return True
+        if all(ok(card[j][i]) for j in range(5)):
+            return True
+    if all(ok(card[i][i]) for i in range(5)):
+        return True
+    if all(ok(card[i][4 - i]) for i in range(5)):
+        return True
+    return False
+
+
+def ball(n):
+    return f"{'BINGO'[(n - 1) // 15]}-{n}"
+
+
+def render_card(card, drawn_set):
+    lines = [" ".join(f"{letter:^4}" for letter in "BINGO")]
+    for row in card:
+        cells = []
+        for v in row:
+            if v == 0:
+                cells.append("[**]")
+            elif v in drawn_set:
+                cells.append(f"[{v:2}]")
+            else:
+                cells.append(f" {v:2} ")
+        lines.append(" ".join(cells))
+    return "\n".join(lines)
+
+
+def render_board(rnd, player):
+    drawn = rnd["drawn"]
+    pot = LIVE_ENTRY_FEE * len(rnd["players"])
+    text = (
+        "🎱 <b>LIVE BINGO</b>\n"
+        f"💰 Pot: {pot} coins · 👥 {len(rnd['players'])} players\n"
+    )
+    if drawn:
+        text += f"🔢 Now: <b>{ball(drawn[-1])}</b> ({len(drawn)}/75)\n"
+        before = ", ".join(ball(x) for x in drawn[-6:-1][::-1])
+        if before:
+            text += f"Before: {before}\n"
+    else:
+        left = max(0, int(LIVE_LOBBY_SECONDS - (time.time() - rnd["created"])))
+        text += f"⏳ Starting in ~{left}s (needs {LIVE_MIN_PLAYERS}+ players)\n"
+    text += "\n<pre>" + render_card(player["card"], set(drawn)) + "</pre>\n"
+    text += "Full row, column or diagonal? Press BINGO! 👇"
+    return text
+
+
+async def refresh_boards(bot, rnd):
+    async def one(player):
+        if not player.get("message_id"):
+            return
+        try:
+            await bot.edit_message_text(
+                chat_id=player["chat_id"],
+                message_id=player["message_id"],
+                text=render_board(rnd, player),
+                parse_mode="HTML",
+                reply_markup=CLAIM_KB,
+            )
+        except Exception:
+            pass  # message unchanged / flood limit: skip this update
+
+    await asyncio.gather(*(one(p) for p in list(rnd["players"].values())))
+
+
+async def broadcast(bot, rnd, text):
+    async def one(player):
+        try:
+            await bot.send_message(chat_id=player["chat_id"], text=text)
+        except Exception:
+            pass
+
+    await asyncio.gather(*(one(p) for p in list(rnd["players"].values())))
+
+
+def claim_win(rnd, winner_id):
+    """Runs without any await, so only ONE claim can ever win. Returns the pot or 0."""
+    if rnd["state"] != "running":
+        return 0
+    rnd["state"] = "finished"
+    pot = LIVE_ENTRY_FEE * len(rnd["players"])
+    settle_live_round(winner_id, pot)
+    if LIVE["round"] is rnd:
+        LIVE["round"] = None
+    return pot
+
+
+async def end_round_refund(bot, rnd, reason):
+    if rnd["state"] == "finished":
+        return
+    rnd["state"] = "finished"
+    refund_live_round()
+    if LIVE["round"] is rnd:
+        LIVE["round"] = None
+    await broadcast(bot, rnd, f"{reason}\n💰 Your {LIVE_ENTRY_FEE} coins were refunded.")
+
+
+async def run_round(bot, rnd):
+    try:
+        await asyncio.sleep(LIVE_LOBBY_SECONDS)
+        if len(rnd["players"]) < LIVE_MIN_PLAYERS:
+            await end_round_refund(bot, rnd, "😕 Not enough players joined this round.")
+            return
+
+        rnd["state"] = "running"
+        numbers = list(range(1, 76))
+        random.shuffle(numbers)
+        for n in numbers:
+            if rnd["state"] != "running":
+                return
+            rnd["drawn"].append(n)
+            await refresh_boards(bot, rnd)
+            await asyncio.sleep(LIVE_DRAW_SECONDS)
+
+        if rnd["state"] == "running":
+            await end_round_refund(bot, rnd, "🎱 All 75 numbers were called and nobody won.")
+    except Exception as e:
+        print(f"Live round error: {e}")
+        await end_round_refund(bot, rnd, "⚠️ Something went wrong, the round was cancelled.")
+
+
+async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    chat_id = update.effective_chat.id
+    get_balance(user_id, name)
+
+    rnd = LIVE["round"]
+
+    if rnd and rnd["state"] == "running":
+        await update.message.reply_text(
+            f"🎱 A round is in progress ({len(rnd['drawn'])}/75 numbers called).\n"
+            "Send /live again in a minute to join the next one!"
+        )
+        return
+    if rnd and user_id in rnd["players"]:
+        await update.message.reply_text("✅ You are already in this round. Watch your card above!")
+        return
+    if rnd and len(rnd["players"]) >= LIVE_MAX_PLAYERS:
+        await update.message.reply_text("🚫 This round is full. Try the next one!")
+        return
+
+    if not join_live_round(user_id, LIVE_ENTRY_FEE):
+        bal = get_balance(user_id, name)
+        await update.message.reply_text(
+            f"💸 Live Bingo costs {LIVE_ENTRY_FEE} coins but you have {bal}.\n"
+            "🎡 Use /spin or 🎁 /daily to earn free coins!"
+        )
+        return
+
+    # No await between here and the end of this block, so state stays consistent
+    created_now = rnd is None
+    if created_now:
+        rnd = {
+            "state": "lobby", "players": {}, "drawn": [], "created": time.time(),
+        }
+        LIVE["round"] = rnd
+        rnd["task"] = asyncio.create_task(run_round(context.bot, rnd))
+
+    player = {
+        "name": name, "chat_id": chat_id, "message_id": None,
+        "card": make_card(), "locked_at": -1,
+    }
+    rnd["players"][user_id] = player
+
+    msg = await update.message.reply_text(
+        render_board(rnd, player), parse_mode="HTML", reply_markup=CLAIM_KB
+    )
+    player["message_id"] = msg.message_id
+
+
+async def live_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    rnd = LIVE["round"]
+
+    if not rnd or user_id not in rnd["players"]:
+        await query.answer("This round is over. Send /live to play again!", show_alert=True)
+        return
+    if rnd["state"] != "running":
+        await query.answer("The round has not started yet.", show_alert=False)
+        return
+
+    player = rnd["players"][user_id]
+    drawn = rnd["drawn"]
+
+    if player["locked_at"] == len(drawn):
+        await query.answer("Wait for the next number before trying again.")
+        return
+
+    if card_has_bingo(player["card"], set(drawn)):
+        pot = claim_win(rnd, user_id)
+        if pot:
+            await query.answer(f"🎉 BINGO! You won {pot} coins!", show_alert=True)
+            await broadcast(
+                context.bot, rnd,
+                f"🏆 BINGO! {player['name']} won the pot of {pot} coins!\n"
+                "Send /live to play again!"
+            )
+        else:
+            await query.answer("Too late, someone was faster!", show_alert=True)
+    else:
+        player["locked_at"] = len(drawn)
+        await query.answer("❌ Not a BINGO yet! Keep watching.", show_alert=True)
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -743,6 +1036,11 @@ if not TOKEN:
 
 init_db()
 
+# If the bot restarted in the middle of a live round, give the entry fees back
+_refunded = refund_live_round()
+if _refunded:
+    print(f"Refunded {_refunded} players from an interrupted live round")
+
 # Health-check web server in the background
 threading.Thread(target=run_health_server, daemon=True).start()
 
@@ -759,6 +1057,8 @@ app.add_handler(CommandHandler("invite", invite))
 app.add_handler(CommandHandler("top", top))
 app.add_handler(CommandHandler("send", send))
 app.add_handler(CommandHandler("id", myid))
+app.add_handler(CommandHandler("live", live))
+app.add_handler(CallbackQueryHandler(live_claim, pattern="^bingo_claim$"))
 app.add_handler(CommandHandler("give", give))
 app.add_handler(CommandHandler("take", take))
 app.add_handler(CommandHandler("stats", stats))
