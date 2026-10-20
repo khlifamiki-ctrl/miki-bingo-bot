@@ -1,10 +1,14 @@
 import os
+import json
+import hmac
+import hashlib
 import time
 import asyncio
 import sqlite3
 import threading
 import random
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qsl
 from datetime import datetime, timezone, timedelta
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -65,11 +69,81 @@ COOLDOWNS = {
 
 # ---------- TINY HEALTH CHECK SERVER ----------
 
+# Address of the Mini App page (only this site may call the API from a browser)
+MINIAPP_ORIGIN = os.environ.get("MINIAPP_ORIGIN", "https://khlifamiki-ctrl.github.io")
+INITDATA_MAX_AGE = 24 * 3600   # Telegram login data older than this is refused
+
+
+def verify_init_data(init_data):
+    """Checks Telegram's signature on the Mini App login data.
+    Returns the Telegram user (dict) if it is genuine, otherwise None."""
+    try:
+        params = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = params.pop("hash", None)
+        if not received_hash:
+            return None
+        check_string = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+        expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, received_hash):
+            return None
+        if time.time() - int(params.get("auth_date", "0")) > INITDATA_MAX_AGE:
+            return None
+        user = json.loads(params["user"])
+        if isinstance(user, dict) and "id" in user:
+            return user
+    except Exception:
+        pass
+    return None
+
+
+def build_me_payload(user):
+    user_id = int(user["id"])
+    name = user.get("first_name") or "Player"
+    return {
+        "name": name,
+        "balance": get_balance(user_id, name),
+        "rank": get_rank(user_id),
+        "top": [
+            {"name": n or "Player", "balance": b} for n, b in get_top_users(10)
+        ],
+    }
+
+
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
 
     class Handler(BaseHTTPRequestHandler):
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", MINIAPP_ORIGIN)
+            self.send_header("Access-Control-Allow-Headers", "X-Telegram-Init-Data")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Vary", "Origin")
+
+        def _json(self, code, data):
+            body = json.dumps(data).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
         def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/api/me":
+                user = verify_init_data(self.headers.get("X-Telegram-Init-Data", ""))
+                if not user:
+                    self._json(401, {"error": "unauthorized"})
+                    return
+                self._json(200, build_me_payload(user))
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"Miki Bingo Bot is running")
@@ -77,7 +151,7 @@ def run_health_server():
         def log_message(self, format, *args):
             pass
 
-    server = HTTPServer(("0.0.0.0", port), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
 
 
