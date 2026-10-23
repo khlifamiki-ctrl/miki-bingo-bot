@@ -53,6 +53,8 @@ LIVE_LOBBY_SECONDS = 60    # time to wait for players
 LIVE_DRAW_SECONDS = 5      # seconds between numbers
 LIVE_MIN_PLAYERS = 2
 LIVE_MAX_PLAYERS = 30
+LIVE_CARD_POOL = 100       # numbered cards to choose from in each round
+LIVE_MAX_CARDS = 4         # cards one player may hold
 
 # Sending coins between players
 SEND_MIN_AMOUNT = 10
@@ -179,6 +181,15 @@ def run_health_server():
                 return
             if path == "/api/live/join":
                 self._run_live(lambda: api_live_join(user))
+            elif path in ("/api/live/pick", "/api/live/unpick"):
+                query = dict(parse_qsl(self.path.partition("?")[2]))
+                try:
+                    card_no = int(query.get("card", ""))
+                except ValueError:
+                    self._json(400, {"error": "bad card"})
+                    return
+                fn = api_live_pick if path == "/api/live/pick" else api_live_unpick
+                self._run_live(lambda: fn(user, card_no))
             elif path == "/api/live/claim":
                 self._run_live(lambda: api_live_claim(user))
             else:
@@ -357,6 +368,38 @@ def join_live_round(user_id, fee):
     conn.commit()
     conn.close()
     return True
+
+
+def buy_live_card(user_id, fee):
+    """Takes the fee for one more card and adds it to the player's total, in one transaction."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+        (fee, user_id, fee)
+    )
+    if cur.rowcount == 0:
+        conn.close()
+        return False
+    cur.execute(
+        "INSERT INTO live_round_players (user_id, fee) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET fee = fee + excluded.fee",
+        (user_id, fee)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def refund_live_card(user_id, fee):
+    """Gives one card's fee back (only used while the round is still in the lobby)."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (fee, user_id))
+    cur.execute("UPDATE live_round_players SET fee = fee - ? WHERE user_id = ?", (fee, user_id))
+    cur.execute("DELETE FROM live_round_players WHERE fee <= 0")
+    conn.commit()
+    conn.close()
 
 
 def settle_live_round(winner_id, pot):
@@ -734,6 +777,23 @@ def card_has_bingo(card, drawn_set):
     return False
 
 
+def new_round():
+    """A fresh round: LIVE_CARD_POOL numbered cards, nobody owns any yet."""
+    return {
+        "state": "lobby", "players": {}, "drawn": [], "created": time.time(),
+        "pool": {n: make_card() for n in range(1, LIVE_CARD_POOL + 1)},
+        "owner": {},   # card number -> user id
+    }
+
+
+def round_pot(rnd):
+    return LIVE_ENTRY_FEE * len(rnd["owner"])
+
+
+def player_bingo(player, drawn_set):
+    return any(card_has_bingo(c, drawn_set) for c in player["cards"].values())
+
+
 def ball(n):
     return f"{'BINGO'[(n - 1) // 15]}-{n}"
 
@@ -755,7 +815,7 @@ def render_card(card, drawn_set):
 
 def render_board(rnd, player):
     drawn = rnd["drawn"]
-    pot = LIVE_ENTRY_FEE * len(rnd["players"])
+    pot = round_pot(rnd)
     text = (
         "🎱 <b>LIVE BINGO</b>\n"
         f"💰 Pot: {pot} coins · 👥 {len(rnd['players'])} players\n"
@@ -768,7 +828,10 @@ def render_board(rnd, player):
     else:
         left = max(0, int(LIVE_LOBBY_SECONDS - (time.time() - rnd["created"])))
         text += f"⏳ Starting in ~{left}s (needs {LIVE_MIN_PLAYERS}+ players)\n"
-    text += "\n<pre>" + render_card(player["card"], set(drawn)) + "</pre>\n"
+    nos = sorted(player["cards"])
+    text += f"\n🎟 Card #{nos[0]}\n<pre>" + render_card(player["cards"][nos[0]], set(drawn)) + "</pre>\n"
+    if len(nos) > 1:
+        text += f"➕ +{len(nos) - 1} more card(s) in the Mini App\n"
     text += "Full row, column or diagonal? Press BINGO! 👇"
     return text
 
@@ -806,7 +869,7 @@ def claim_win(rnd, winner_id):
     if rnd["state"] != "running":
         return 0
     rnd["state"] = "finished"
-    pot = LIVE_ENTRY_FEE * len(rnd["players"])
+    pot = round_pot(rnd)
     settle_live_round(winner_id, pot)
     if LIVE["round"] is rnd:
         LIVE["round"] = None
@@ -826,7 +889,7 @@ async def end_round_refund(bot, rnd, reason):
         LIVE["round"] = None
     code = "few" if "Not enough" in reason else ("nowin" if "All 75" in reason else "error")
     LIVE_LAST["result"] = {"kind": "refund", "code": code, "at": time.time()}
-    await broadcast(bot, rnd, f"{reason}\n💰 Your {LIVE_ENTRY_FEE} coins were refunded.")
+    await broadcast(bot, rnd, f"{reason}\n💰 Your entry coins were refunded.")
 
 
 async def run_round(bot, rnd):
@@ -853,8 +916,71 @@ async def run_round(bot, rnd):
         await end_round_refund(bot, rnd, "⚠️ Something went wrong, the round was cancelled.")
 
 
+def try_pick(user_id, name, chat_id, bot, card_no):
+    """Buys one numbered card (and opens a new round if none is waiting).
+    Must run on the bot's event loop. Returns (status, round).
+    Statuses: picked, taken, invalid, limit, no_coins, running, full."""
+    rnd = LIVE["round"]
+
+    if rnd and rnd["state"] == "running":
+        return "running", rnd
+    if not (1 <= card_no <= LIVE_CARD_POOL):
+        return "invalid", rnd
+    player = None
+    if rnd:
+        if card_no in rnd["owner"]:
+            return "taken", rnd
+        player = rnd["players"].get(user_id)
+        if player and len(player["cards"]) >= LIVE_MAX_CARDS:
+            return "limit", rnd
+        if not player and len(rnd["players"]) >= LIVE_MAX_PLAYERS:
+            return "full", rnd
+    if not buy_live_card(user_id, LIVE_ENTRY_FEE):
+        return "no_coins", rnd
+
+    # No await below, so the round state stays consistent
+    if rnd is None:
+        rnd = new_round()
+        LIVE["round"] = rnd
+        rnd["task"] = asyncio.create_task(run_round(bot, rnd))
+    player = rnd["players"].get(user_id)
+    if not player:
+        player = {
+            "name": name, "chat_id": chat_id, "message_id": None,
+            "cards": {}, "locked_at": -1,
+        }
+        rnd["players"][user_id] = player
+    player["cards"][card_no] = rnd["pool"][card_no]
+    rnd["owner"][card_no] = user_id
+    return "picked", rnd
+
+
+def try_unpick(user_id, card_no):
+    """Gives a card back (lobby only) and refunds its fee."""
+    rnd = LIVE["round"]
+    if not rnd:
+        return "no_round"
+    if rnd["state"] != "lobby":
+        return "running"
+    player = rnd["players"].get(user_id)
+    if not player or card_no not in player["cards"]:
+        return "not_yours"
+    refund_live_card(user_id, LIVE_ENTRY_FEE)
+    del player["cards"][card_no]
+    del rnd["owner"][card_no]
+    if not player["cards"]:
+        del rnd["players"][user_id]
+    if not rnd["players"]:           # last player left: the round simply disappears
+        rnd["state"] = "finished"
+        LIVE["round"] = None
+        task = rnd.get("task")
+        if task:
+            task.cancel()
+    return "removed"
+
+
 def try_join(user_id, name, chat_id, bot):
-    """Joins the current round (or opens a new one). Must run on the bot's event loop.
+    """Quick join (used by /live in the chat): gives one random free card.
     Returns (status, round, player). Statuses: joined, already, running, full, no_coins."""
     rnd = LIVE["round"]
 
@@ -862,25 +988,13 @@ def try_join(user_id, name, chat_id, bot):
         return "running", rnd, None
     if rnd and user_id in rnd["players"]:
         return "already", rnd, rnd["players"][user_id]
-    if rnd and len(rnd["players"]) >= LIVE_MAX_PLAYERS:
+    free = [n for n in range(1, LIVE_CARD_POOL + 1) if not rnd or n not in rnd["owner"]]
+    if not free:
         return "full", rnd, None
-    if not join_live_round(user_id, LIVE_ENTRY_FEE):
-        return "no_coins", rnd, None
-
-    # No await in this function, so the round state stays consistent
-    if rnd is None:
-        rnd = {
-            "state": "lobby", "players": {}, "drawn": [], "created": time.time(),
-        }
-        LIVE["round"] = rnd
-        rnd["task"] = asyncio.create_task(run_round(bot, rnd))
-
-    player = {
-        "name": name, "chat_id": chat_id, "message_id": None,
-        "card": make_card(), "locked_at": -1,
-    }
-    rnd["players"][user_id] = player
-    return "joined", rnd, player
+    status, rnd = try_pick(user_id, name, chat_id, bot, random.choice(free))
+    if status == "picked":
+        return "joined", rnd, rnd["players"][user_id]
+    return status, rnd, None
 
 
 async def announce_win(bot, rnd, winner_name, pot):
@@ -914,11 +1028,13 @@ async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💸 Live Bingo costs {LIVE_ENTRY_FEE} coins but you have {bal}.\n"
             "🎡 Use /spin or 🎁 /daily to earn free coins!"
         )
-    else:
+    elif status == "joined":
         msg = await update.message.reply_text(
             render_board(rnd, player), parse_mode="HTML", reply_markup=CLAIM_KB
         )
         player["message_id"] = msg.message_id
+    else:
+        await update.message.reply_text("🚫 Could not join this round. Try again!")
 
 
 async def live_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,7 +1056,7 @@ async def live_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Wait for the next number before trying again.")
         return
 
-    if card_has_bingo(player["card"], set(drawn)):
+    if player_bingo(player, set(drawn)):
         pot = claim_win(rnd, user_id)
         if pot:
             await query.answer(f"🎉 BINGO! You won {pot} coins!", show_alert=True)
@@ -961,8 +1077,12 @@ def live_state_for(user_id):
         "entry_fee": LIVE_ENTRY_FEE,
         "min_players": LIVE_MIN_PLAYERS,
         "max_players": LIVE_MAX_PLAYERS,
+        "pool_size": LIVE_CARD_POOL,
+        "max_cards": LIVE_MAX_CARDS,
         "state": "none",
         "last": None,
+        "taken": [],
+        "mine": [],
     }
     last = LIVE_LAST["result"]
     if last and time.time() - last["at"] < 120:
@@ -972,16 +1092,21 @@ def live_state_for(user_id):
 
     out["state"] = rnd["state"]
     out["players"] = len(rnd["players"])
-    out["pot"] = LIVE_ENTRY_FEE * len(rnd["players"])
+    out["cards_total"] = len(rnd["owner"])
+    out["pot"] = round_pot(rnd)
     out["drawn"] = list(rnd["drawn"])
     if rnd["state"] == "lobby":
         out["starts_in"] = max(0, int(LIVE_LOBBY_SECONDS - (time.time() - rnd["created"])))
+    out["taken"] = sorted(n for n, u in rnd["owner"].items() if u != user_id)
     player = rnd["players"].get(user_id)
     if player:
-        out["you"] = {
-            "card": player["card"],
-            "has_bingo": card_has_bingo(player["card"], set(rnd["drawn"])),
-        }
+        drawn_set = set(rnd["drawn"])
+        cards = [
+            {"no": n, "card": c, "has_bingo": card_has_bingo(c, drawn_set)}
+            for n, c in sorted(player["cards"].items())
+        ]
+        out["mine"] = [c["no"] for c in cards]
+        out["you"] = {"cards": cards, "has_bingo": any(c["has_bingo"] for c in cards)}
     return out
 
 
@@ -997,6 +1122,26 @@ async def api_live_join(user):
     out = live_state_for(user_id)
     out["status"] = status
     out["balance"] = get_balance(user_id, name)
+    return out
+
+
+async def api_live_pick(user, card_no):
+    user_id = int(user["id"])
+    name = user.get("first_name") or "Player"
+    get_balance(user_id, name)
+    status, rnd = try_pick(user_id, name, user_id, APP_STATE["bot"], card_no)
+    out = live_state_for(user_id)
+    out["status"] = status
+    out["balance"] = get_balance(user_id, name)
+    return out
+
+
+async def api_live_unpick(user, card_no):
+    user_id = int(user["id"])
+    status = try_unpick(user_id, card_no)
+    out = live_state_for(user_id)
+    out["status"] = status
+    out["balance"] = get_balance(user_id, user.get("first_name") or "Player")
     return out
 
 
@@ -1019,7 +1164,7 @@ async def api_live_claim(user):
     if player["locked_at"] == len(drawn):
         return {"result": "wait"}
 
-    if not card_has_bingo(player["card"], set(drawn)):
+    if not player_bingo(player, set(drawn)):
         player["locked_at"] = len(drawn)
         return {"result": "not_bingo"}
 
