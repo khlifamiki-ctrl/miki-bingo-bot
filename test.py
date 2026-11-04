@@ -23,6 +23,10 @@ if os.path.isdir("/data"):
 else:
     DB_FILE = "bingo.db"
 
+def db():
+    """Opens the database. Waits up to 15 seconds if another thread is writing."""
+    return sqlite3.connect(DB_FILE, timeout=15)
+
 DAILY_BONUS_AMOUNT = 100
 DAILY_COOLDOWN_HOURS = 24
 REFERRER_REWARD = 100
@@ -66,7 +70,6 @@ COOLDOWNS = {
     "bingo": 600,      # 10 minutes
     "jackpot": 1800,   # 30 minutes
     "send": 60,        # 1 minute between transfers
-    "redeem": 10,      # gift codes: slows down guessing
 }
 
 
@@ -107,7 +110,6 @@ def build_me_payload(user):
         "name": name,
         "balance": get_balance(user_id, name),
         "rank": get_rank(user_id),
-        "daily_left": daily_seconds_left(user_id, name),
         "top": [
             {"name": n or "Player", "balance": b} for n, b in get_top_users(10)
         ],
@@ -117,7 +119,7 @@ def build_me_payload(user):
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
 
-class Handler(BaseHTTPRequestHandler):
+    class Handler(BaseHTTPRequestHandler):
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", MINIAPP_ORIGIN)
             self.send_header("Access-Control-Allow-Headers", "X-Telegram-Init-Data")
@@ -194,12 +196,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._run_live(lambda: fn(user, card_no))
             elif path == "/api/live/claim":
                 self._run_live(lambda: api_live_claim(user))
-            elif path == "/api/daily":
-                ok, bal, left = claim_daily(int(user["id"]), user.get("first_name") or "Player")
-                self._json(200, {"ok": ok, "balance": bal, "left": left, "amount": DAILY_BONUS_AMOUNT})
-            elif path == "/api/redeem":
-                code = dict(parse_qsl(self.path.partition("?")[2])).get("code", "")
-                self._json(200, api_redeem(user, code))
             else:
                 self._json(404, {"error": "not found"})
 
@@ -213,9 +209,9 @@ class Handler(BaseHTTPRequestHandler):
 # ---------- DATABASE SETUP ----------
 
 def init_db():
-
-conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -240,21 +236,6 @@ conn = sqlite3.connect(DB_FILE)
             fee INTEGER
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS gift_codes (
-            code TEXT PRIMARY KEY,
-            amount INTEGER,
-            max_uses INTEGER DEFAULT 0,
-            used INTEGER DEFAULT 0
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS gift_redemptions (
-            code TEXT,
-            user_id INTEGER,
-            PRIMARY KEY (code, user_id)
-        )
-    """)
     conn.commit()
 
     for column_def in ["last_daily_bonus TEXT", "referred_by INTEGER"]:
@@ -268,7 +249,7 @@ conn = sqlite3.connect(DB_FILE)
 
 
 def user_exists(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -277,10 +258,10 @@ def user_exists(user_id):
 
 
 def create_user(user_id, username, referred_by=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO users (user_id, username, balance, referred_by) VALUES (?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO users (user_id, username, balance, referred_by) VALUES (?, ?, ?, ?)",
         (user_id, username, 0, referred_by)
     )
     conn.commit()
@@ -291,7 +272,7 @@ def get_balance(user_id, username):
     if not user_exists(user_id):
         create_user(user_id, username)
         return 0
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -301,7 +282,7 @@ def get_balance(user_id, username):
 
 def update_balance(user_id, username, delta):
     get_balance(user_id, username)
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     if username:
         cur.execute(
@@ -323,7 +304,7 @@ def update_balance(user_id, username, delta):
 
 def get_last_daily_bonus(user_id, username):
     get_balance(user_id, username)
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("SELECT last_daily_bonus FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -332,7 +313,7 @@ def get_last_daily_bonus(user_id, username):
 
 
 def set_last_daily_bonus(user_id, timestamp_str):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET last_daily_bonus = ? WHERE user_id = ?",
@@ -343,7 +324,7 @@ def set_last_daily_bonus(user_id, timestamp_str):
 
 
 def get_top_users(limit=10):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "SELECT username, balance FROM users ORDER BY balance DESC, created_at ASC LIMIT ?",
@@ -353,9 +334,10 @@ def get_top_users(limit=10):
     conn.close()
     return rows
 
+
 def transfer_coins(from_id, to_id, amount):
     """Moves coins in ONE database transaction. Returns False if not enough coins."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
@@ -375,7 +357,7 @@ def transfer_coins(from_id, to_id, amount):
 
 def join_live_round(user_id, fee):
     """Takes the entry fee and records it, in one transaction. False if not enough coins."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
@@ -395,7 +377,7 @@ def join_live_round(user_id, fee):
 
 def buy_live_card(user_id, fee):
     """Takes the fee for one more card and adds it to the player's total, in one transaction."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
@@ -416,7 +398,7 @@ def buy_live_card(user_id, fee):
 
 def refund_live_card(user_id, fee):
     """Gives one card's fee back (only used while the round is still in the lobby)."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (fee, user_id))
     cur.execute("UPDATE live_round_players SET fee = fee - ? WHERE user_id = ?", (fee, user_id))
@@ -427,7 +409,7 @@ def refund_live_card(user_id, fee):
 
 def settle_live_round(winner_id, pot):
     """Pays the pot to the winner and clears the round, in one transaction."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (pot, winner_id))
     cur.execute("DELETE FROM live_round_players")
@@ -437,7 +419,7 @@ def settle_live_round(winner_id, pot):
 
 def refund_live_round():
     """Gives every entry fee back and clears the round. Returns how many players."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("""
         UPDATE users SET balance = balance +
@@ -451,84 +433,8 @@ def refund_live_round():
     return count
 
 
-def clean_code(text):
-    return "".join(ch for ch in (text or "").upper() if ch.isalnum())[:20]
-
-
-def create_gift_code(code, amount, max_uses):
-    """Admin: makes (or updates) a gift code. max_uses 0 = unlimited. Each player can use a code once."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "INSERT OR REPLACE INTO gift_codes (code, amount, max_uses, used) VALUES "
-        "(?, ?, ?, COALESCE((SELECT used FROM gift_codes WHERE code = ?), 0))",
-        (code, amount, max_uses, code)
-    )
-    conn.commit()
-    conn.close()
-
-
-def redeem_gift_code(user_id, code):
-    """One transaction. Returns ('ok', amount), ('invalid', 0), ('used', 0) or ('empty', 0)."""
-
-conn = sqlite3.connect(DB_FILE)
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT amount FROM gift_codes WHERE code = ?", (code,))
-        row = cur.fetchone()
-        if not row:
-            return "invalid", 0
-        amount = row[0]
-        try:
-            cur.execute("INSERT INTO gift_redemptions (code, user_id) VALUES (?, ?)", (code, user_id))
-        except sqlite3.IntegrityError:
-            return "used", 0
-        cur.execute(
-            "UPDATE gift_codes SET used = used + 1 WHERE code = ? AND (max_uses = 0 OR used < max_uses)",
-            (code,)
-        )
-        if cur.rowcount == 0:
-            conn.rollback()
-            return "empty", 0
-        cur.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        conn.commit()
-        return "ok", amount
-    finally:
-        conn.close()
-
-
-def daily_seconds_left(user_id, name):
-    last = get_last_daily_bonus(user_id, name)
-    if not last:
-        return 0
-    left = timedelta(hours=DAILY_COOLDOWN_HOURS) - (datetime.now(timezone.utc) - datetime.fromisoformat(last))
-    return max(0, int(left.total_seconds()))
-
-
-def claim_daily(user_id, name):
-    """Same rule as /daily, for the Mini App. Returns (ok, balance, seconds_left)."""
-    left = daily_seconds_left(user_id, name)
-    if left > 0:
-        return False, get_balance(user_id, name), left
-    new_balance = update_balance(user_id, name, DAILY_BONUS_AMOUNT)
-    set_last_daily_bonus(user_id, datetime.now(timezone.utc).isoformat())
-    return True, new_balance, DAILY_COOLDOWN_HOURS * 3600
-
-
-def api_redeem(user, raw_code):
-    user_id = int(user["id"])
-    name = user.get("first_name") or "Player"
-    get_balance(user_id, name)
-    wait = get_cooldown_remaining(user_id, "redeem")
-    if wait > 0:
-        return {"result": "wait", "left": wait, "balance": get_balance(user_id, name)}
-    set_cooldown(user_id, "redeem")   # also after a wrong code, so codes can't be guessed fast
-    code = clean_code(raw_code)
-    status, amount = redeem_gift_code(user_id, code) if code else ("invalid", 0)
-    return {"result": status, "amount": amount, "balance": get_balance(user_id, name)}
-
-
 def get_stats():
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*), COALESCE(SUM(balance), 0) FROM users")
     total_users, total_coins = cur.fetchone()
@@ -541,7 +447,7 @@ def get_stats():
 
 
 def get_user_info(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "SELECT username, balance, referred_by, created_at FROM users WHERE user_id = ?",
@@ -558,7 +464,7 @@ def get_user_info(user_id):
 
 
 def get_rank(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "SELECT COUNT(*) + 1 FROM users WHERE balance > (SELECT balance FROM users WHERE user_id = ?)",
@@ -573,7 +479,7 @@ def get_rank(user_id):
 
 def get_cooldown_remaining(user_id, game):
     """Returns seconds left before the user can play again (0 = can play)."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "SELECT last_play FROM cooldowns WHERE user_id = ? AND game = ?",
@@ -590,8 +496,9 @@ def get_cooldown_remaining(user_id, game):
     remaining = COOLDOWNS[game] - elapsed
     return max(0, int(remaining))
 
+
 def set_cooldown(user_id, game):
-    conn = sqlite3.connect(DB_FILE)
+    conn = db()
     cur = conn.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO cooldowns (user_id, game, last_play) VALUES (?, ?, ?)",
@@ -689,8 +596,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎱 /live - Live Bingo round ({LIVE_ENTRY_FEE} coins)\n"
         "💌 /send - Send coins to a friend\n"
         "🆔 /id - Show your ID\n"
-        "👥 /invite - Invite friends\n"
-        "🎟 /redeem - Use a gift code\n\n"
+        "👥 /invite - Invite friends\n\n"
         "👇 Choose a button below 👇"
     )
 
@@ -718,7 +624,7 @@ async def bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     get_balance(user_id, name)
 
-if await blocked_by_cooldown(update, user_id, name, "bingo"):
+    if await blocked_by_cooldown(update, user_id, name, "bingo"):
         return
     if await not_enough_coins(update, user_id, name, "bingo"):
         return
@@ -838,6 +744,7 @@ LIVE = {"round": None}   # the one round that is running right now
 LIVE_LAST = {"result": None}   # how the most recent round ended (shown in the Mini App)
 APP_STATE = {"loop": None, "bot": None}   # filled when the bot starts (used by the web API)
 BG_TASKS = set()
+
 
 def spawn(coro):
     """Runs a coroutine in the background and keeps a reference so it is not dropped."""
@@ -964,8 +871,7 @@ async def broadcast(bot, rnd, text):
 
 def claim_win(rnd, winner_id):
     """Runs without any await, so only ONE claim can ever win. Returns the pot or 0."""
-
-if rnd["state"] != "running":
+    if rnd["state"] != "running":
         return 0
     rnd["state"] = "finished"
     pot = round_pot(rnd)
@@ -1083,7 +989,7 @@ def try_join(user_id, name, chat_id, bot):
     Returns (status, round, player). Statuses: joined, already, running, full, no_coins."""
     rnd = LIVE["round"]
 
-if rnd and rnd["state"] == "running":
+    if rnd and rnd["state"] == "running":
         return "running", rnd, None
     if rnd and user_id in rnd["players"]:
         return "already", rnd, rnd["players"][user_id]
@@ -1189,7 +1095,7 @@ def live_state_for(user_id):
     if not rnd:
         return out
 
-out["state"] = rnd["state"]
+    out["state"] = rnd["state"]
     out["players"] = len(rnd["players"])
     out["cards_total"] = len(rnd["owner"])
     out["pot"] = round_pot(rnd)
@@ -1309,7 +1215,7 @@ async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_id, amount = parsed
 
-if target_id == user_id:
+    if target_id == user_id:
         await update.message.reply_text("🚫 You can't send coins to yourself.")
         return
     if amount < SEND_MIN_AMOUNT:
@@ -1433,7 +1339,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
-total_users, total_coins, new_today = get_stats()
+    total_users, total_coins, new_today = get_stats()
     await update.message.reply_text(
         "📊 BOT STATS\n\n"
         f"👥 Total users: {total_users}\n"
@@ -1501,44 +1407,6 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    name = update.effective_user.first_name
-    get_balance(user_id, name)
-    if not context.args:
-        await update.message.reply_text("Usage: /redeem <CODE>")
-        return
-    if await blocked_by_cooldown(update, user_id, name, "redeem"):
-        return
-    set_cooldown(user_id, "redeem")
-    status, amount = redeem_gift_code(user_id, clean_code(context.args[0]))
-    messages = {
-        "ok": f"🎁 Code accepted! +{amount} coins\n💰 Balance: {get_balance(user_id, name)}",
-        "used": "🚫 You already used this code.",
-        "empty": "😕 This code has no uses left.",
-        "invalid": "❌ Wrong code.",
-    }
-    await update.message.reply_text(messages[status])
-
-
-async def newcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    a = context.args
-    if len(a) not in (2, 3) or not a[1].isdigit() or int(a[1]) <= 0 or (len(a) == 3 and not a[2].isdigit()):
-        await update.message.reply_text("Usage: /newcode <CODE> <amount> [max_uses]\n(max_uses 0 or empty = unlimited)")
-        return
-    code = clean_code(a[0])
-    if not code:
-        await update.message.reply_text("❌ The code needs letters or numbers.")
-        return
-    max_uses = int(a[2]) if len(a) == 3 else 0
-    create_gift_code(code, int(a[1]), max_uses)
-    await update.message.reply_text(
-        f"✅ Code {code}: +{a[1]} coins per player, max uses: {max_uses or 'unlimited'}"
-    )
-
-
 # ---------- MAIN ----------
 
 if not TOKEN:
@@ -1578,8 +1446,6 @@ app.add_handler(CommandHandler("give", give))
 app.add_handler(CommandHandler("take", take))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("user", userinfo))
-app.add_handler(CommandHandler("redeem", redeem))
-app.add_handler(CommandHandler("newcode", newcode))
 
 print(f"Bot is running. Database: {DB_FILE}")
 
